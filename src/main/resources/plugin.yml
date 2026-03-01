@@ -1,0 +1,16 @@
+name: SimpleGenBlocks
+version: 1.0.0
+main: local.simplegenblocks.SimpleGenBlocksPlugin
+api-version: '1.21'
+depend: [Vault]
+commands:
+  gen:
+    description: Open the GenBlocks HUD/shop
+    usage: /gen | /gen give <player> <item> [amount]
+  genblocks:
+    description: Open the GenBlocks HUD/shop
+    usage: /genblocks | /genblocks give <player> <item> [amount]
+permissions:
+  simplegenblocks.admin:
+    description: Admin commands for SimpleGenBlocks
+    default: op

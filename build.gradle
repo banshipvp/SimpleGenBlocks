@@ -1,0 +1,31 @@
+plugins {
+    id 'java'
+}
+
+group = 'local.simplegenblocks'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+
+    maven {
+        name = 'papermc'
+        url = 'https://repo.papermc.io/repository/maven-public/'
+    }
+
+    maven {
+        name = 'jitpack'
+        url = 'https://jitpack.io'
+    }
+}
+
+dependencies {
+    compileOnly 'io.papermc.paper:paper-api:1.21.10-R0.1-SNAPSHOT'
+    compileOnly 'com.github.MilkBowl:VaultAPI:1.7.1'
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
