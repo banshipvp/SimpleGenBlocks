@@ -31,8 +31,15 @@ public class SimpleGenBlocksPlugin extends JavaPlugin {
         hud = new GenHud(itemFactory);
 
         GenCommand command = new GenCommand(this);
-        if (getCommand("gen") != null) getCommand("gen").setExecutor(command);
-        if (getCommand("genblocks") != null) getCommand("genblocks").setExecutor(command);
+        SimpleGenBlocksTabCompleter tabCompleter = new SimpleGenBlocksTabCompleter();
+        if (getCommand("gen") != null) {
+            getCommand("gen").setExecutor(command);
+            getCommand("gen").setTabCompleter(tabCompleter);
+        }
+        if (getCommand("genblocks") != null) {
+            getCommand("genblocks").setExecutor(command);
+            getCommand("genblocks").setTabCompleter(tabCompleter);
+        }
 
         Bukkit.getPluginManager().registerEvents(new GenListener(this), this);
 
