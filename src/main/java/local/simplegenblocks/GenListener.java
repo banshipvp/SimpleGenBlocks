@@ -4,36 +4,71 @@ import org.bukkit.Material;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.entity.Player;
+import org.bukkit.scheduler.BukkitRunnable;
 import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.event.EventHandler;
+import org.bukkit.event.EventPriority;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockPlaceEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
-import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.player.PlayerBucketEmptyEvent;
+import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 public class GenListener implements Listener {
 
-    private static final int GENERATOR_MAX_DISTANCE = 319;
+    private static final int  GENERATOR_MAX_DISTANCE = 319;
+    private static final long     TICKS_PER_BLOCK = 4L;  // 5 blocks/sec
+    private static final Material ANIM_ACTIVE     = Material.GREEN_WOOL;
+    private static final Material ANIM_REMOVING   = Material.RED_WOOL;
+
+    // ── Animation state ───────────────────────────────────────────────────────
+    private static final class GenAnimation {
+        final Player      player;
+        final Block       origin;       // the green-wool marker block
+        final List<Block> targets;      // blocks to fill (excluding origin)
+        final List<Block> placed;       // blocks already filled (for undo)
+        final Material    output;
+        final BlockFace   direction;
+        int               nextIndex = 0;
+        boolean           removing  = false;
+        int               removeIndex = 0;
+        BukkitTask        task;
+
+        GenAnimation(Player player, Block origin, List<Block> targets, Material output, BlockFace direction) {
+            this.player    = player;
+            this.origin    = origin;
+            this.targets   = targets;
+            this.placed    = new ArrayList<>();
+            this.output    = output;
+            this.direction = direction;
+        }
+    }
+
+    // Key = blockKey of origin block → active animation
+    private final Map<String, GenAnimation> animations = new HashMap<>();
 
     private final SimpleGenBlocksPlugin plugin;
-    private final GenItemFactory itemFactory;
-    private final Map<String, BukkitTask> pendingGeneratorTasks = new HashMap<>();
+    private final GenItemFactory        itemFactory;
 
     public GenListener(SimpleGenBlocksPlugin plugin) {
-        this.plugin = plugin;
+        this.plugin      = plugin;
         this.itemFactory = plugin.getItemFactory();
     }
 
+    // ── GUI Click ─────────────────────────────────────────────────────────────
     @EventHandler
     public void onGuiClick(InventoryClickEvent event) {
         String title = event.getView().getTitle();
-        if (!GenHud.TITLE_MAIN.equals(title) && !title.startsWith(GenHud.TITLE_DIRECTION_PREFIX)) return;
+        if (!GenHud.TITLE_MAIN.equals(title)
+                && !title.startsWith(GenHud.TITLE_DIRECTION_PREFIX)
+                && !GenHud.TITLE_LAVA_DIRECTION.equals(title)) return;
 
         event.setCancelled(true);
         if (!(event.getWhoClicked() instanceof Player player)) return;
@@ -146,107 +181,161 @@ public class GenListener implements Listener {
 
         Player player = event.getPlayer();
         BlockFace direction = itemFactory.getDirectionFromItem(item);
-        if (direction == null) {
-            direction = resolveDirection(player);
+        if (direction == null) direction = resolveDirection(player);
+
+        final BlockFace dir    = direction;
+        final Material  output = type.getGeneratorOutput();
+        final Block     origin = event.getBlockPlaced();
+        final String    key    = blockKey(origin);
+
+        // Cancel any previous animation at this location
+        cancelExistingAnimation(key, false);
+
+        // Collect target blocks in direction (excluding the origin itself)
+        List<Block> targets = new ArrayList<>();
+        for (int i = 1; i < GENERATOR_MAX_DISTANCE; i++) {
+            Block next = origin.getRelative(dir, i);
+            if (!canOverwrite(next.getType())) break;
+            targets.add(next);
         }
-        final BlockFace generationDirection = direction;
 
-        Material output = type.getGeneratorOutput();
-        Block placed = event.getBlockPlaced();
-        if (canOverwriteGenerated(placed.getType())) {
-            placed.setType(output, false);
-        }
+        // Defer one tick so Bukkit's post-event block finalisation is done
+        // before we overwrite the origin with green wool.
+        plugin.getServer().getScheduler().runTask(plugin, () -> {
+            // Origin block becomes the green-wool marker
+            origin.setType(ANIM_ACTIVE, false);
 
-        long delayTicks = Math.max(1L, plugin.getConfig().getLong("generator.place-delay-ticks", 40L));
-        String key = blockKey(placed);
+            GenAnimation anim = new GenAnimation(player, origin, targets, output, dir);
+            animations.put(key, anim);
 
-        BukkitTask existing = pendingGeneratorTasks.remove(key);
-        if (existing != null) {
-            existing.cancel();
-        }
+            player.sendMessage("§aGenerator placed! Filling §f" + targets.size() + " §a"
+                    + output.name().toLowerCase() + " blocks toward §f" + dir.name()
+                    + "§a. §7(Left-click the green wool to cancel & undo)");
 
-        BukkitTask task = plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
-            pendingGeneratorTasks.remove(key);
+            BukkitTask task = new BukkitRunnable() {
+                @Override public void run() {
+                    GenAnimation a = animations.get(key);
+                    if (a == null) { cancel(); return; }
 
-            int generated = 1;
-            for (int i = 1; i < GENERATOR_MAX_DISTANCE; i++) {
-                Block next = placed.getRelative(generationDirection, i);
-                if (!canOverwriteGenerated(next.getType())) continue;
-                next.setType(output, false);
-                generated++;
-            }
+                    if (a.nextIndex >= a.targets.size()) {
+                        // Done — remove the green wool marker
+                        animations.remove(key);
+                        if (a.origin.getType() == ANIM_ACTIVE) a.origin.setType(Material.AIR, false);
+                        player.sendMessage("§a✔ Generation complete! §f" + a.placed.size()
+                                + " §a" + output.name().toLowerCase() + " blocks placed.");
+                        cancel();
+                        return;
+                    }
 
-            player.sendMessage("§aGenerated §f" + generated + " " + output.name().toLowerCase() + " §ablocks toward §f" + generationDirection.name() + "§a.");
-        }, delayTicks);
+                    Block b = a.targets.get(a.nextIndex++);
+                    if (canOverwrite(b.getType())) {
+                        b.setType(output, false);
+                        a.placed.add(b);
+                    }
+                }
+            }.runTaskTimer(plugin, TICKS_PER_BLOCK, TICKS_PER_BLOCK);
 
-        pendingGeneratorTasks.put(key, task);
-        player.sendMessage("§eGen placement queued (§f" + (delayTicks / 20.0) + "s§e). Left-click the origin block to cancel.");
+            anim.task = task;
+        });
     }
 
+    // ── Left-click cancel + fat bucket right-click ────────────────────────────
     @EventHandler
-    public void onBucketEmpty(PlayerBucketEmptyEvent event) {
-        ItemStack item = event.getItemStack();
-        GenItemType type = itemFactory.getTypeFromItem(item);
-        if (type == null) return;
-
-        Block target = event.getBlockClicked().getRelative(event.getBlockFace());
-
-        if (type.isLavaGenBucket()) {
-            event.setCancelled(true);
-            BlockFace direction = itemFactory.getDirectionFromItem(item);
-            int placed = placeVerticalLavaColumn(target, direction == BlockFace.DOWN ? BlockFace.DOWN : BlockFace.UP);
-            consumeSingleBucket(event.getPlayer(), event.getHand());
-            event.getPlayer().sendMessage("§aLava Gen Bucket placed §f" + placed + " §alava source blocks.");
-            return;
-        }
-    }
-
-    @EventHandler
-    public void onFatBucketFill(PlayerInteractEvent event) {
-        if (event.getAction().isLeftClick() && event.getClickedBlock() != null) {
+    public void onInteract(PlayerInteractEvent event) {
+        // Left-click the red-wool marker while removal is in progress → ignore
+        if (event.getAction().isLeftClick() && event.getClickedBlock() != null
+                && event.getClickedBlock().getType() == ANIM_REMOVING) {
             String key = blockKey(event.getClickedBlock());
-            BukkitTask task = pendingGeneratorTasks.remove(key);
-            if (task != null) {
-                task.cancel();
-                event.getClickedBlock().setType(Material.AIR, false);
-                event.getPlayer().sendMessage("§cCancelled queued gen placement.");
+            if (animations.containsKey(key)) {
                 event.setCancelled(true);
                 return;
             }
         }
 
+        // Left-click the green-wool marker → turn red and remove blocks 5/sec in reverse
+        if (event.getAction().isLeftClick() && event.getClickedBlock() != null
+                && event.getClickedBlock().getType() == ANIM_ACTIVE) {
+            String key = blockKey(event.getClickedBlock());
+            GenAnimation anim = animations.get(key);
+            if (anim != null && !anim.removing) {
+                // Stop the forward fill task
+                if (anim.task != null) anim.task.cancel();
+
+                // Turn green wool → red wool
+                if (anim.origin.getType() == ANIM_ACTIVE) anim.origin.setType(ANIM_REMOVING, false);
+                anim.removing    = true;
+                anim.removeIndex = anim.placed.size() - 1;
+                int total = anim.placed.size();
+                anim.player.sendMessage("§c✖ Cancelling gen... removing §f" + total + " §cblocks.");
+
+                BukkitTask removeTask = new BukkitRunnable() {
+                    @Override public void run() {
+                        GenAnimation a = animations.get(key);
+                        if (a == null) { cancel(); return; }
+
+                        if (a.removeIndex < 0) {
+                            animations.remove(key);
+                            if (a.origin.getType() == ANIM_REMOVING) a.origin.setType(Material.AIR, false);
+                            a.player.sendMessage("§c✔ Gen removed! Cleared §f" + total + " §cblocks.");
+                            cancel();
+                            return;
+                        }
+
+                        Block b = a.placed.get(a.removeIndex--);
+                        if (b.getType() == a.output) b.setType(Material.AIR, false);
+                    }
+                }.runTaskTimer(plugin, TICKS_PER_BLOCK, TICKS_PER_BLOCK);
+
+                anim.task = removeTask;
+                event.setCancelled(true);
+                return;
+            }
+        }
+
+        // Fat bucket: right-click, main hand only
         if (event.getHand() != EquipmentSlot.HAND) return;
-        if (event.getClickedBlock() == null) return;
         if (!event.getAction().isRightClick()) return;
 
-        Player player = event.getPlayer();
+        Player    player   = event.getPlayer();
         ItemStack handItem = player.getInventory().getItemInMainHand();
-        GenItemType type = itemFactory.getTypeFromItem(handItem);
+        GenItemType type   = itemFactory.getTypeFromItem(handItem);
         if (type == null || !type.isFatBucket()) return;
 
-        // Fully override vanilla bucket behavior for fat buckets
         event.setCancelled(true);
 
         Material neededFluid = type.getFatBucketFluidType();
-        Material clickedType = event.getClickedBlock().getType();
-        if (clickedType == neededFluid) {
-            int units = itemFactory.getFatBucketUnits(handItem);
-            if (units >= GenItemFactory.FAT_BUCKET_CAPACITY) {
-                player.sendMessage("§eThat fat bucket is already full.");
-                return;
+
+        // ── Try to FILL: ray-trace to detect fluid source blocks ──────────────
+        // Fluid blocks don't register as a normal clickedBlock, so we ray-trace
+        // with FluidCollisionMode.ALWAYS to find lava/water source blocks.
+        var rt = player.rayTraceBlocks(5.0, org.bukkit.FluidCollisionMode.ALWAYS);
+        if (rt != null && rt.getHitBlock() != null) {
+            Block hit = rt.getHitBlock();
+            if (hit.getType() == neededFluid) {
+                // Only allow picking up a SOURCE block (level == 0)
+                boolean isSource = !(hit.getBlockData() instanceof org.bukkit.block.data.Levelled lev)
+                        || lev.getLevel() == 0;
+                if (isSource) {
+                    int units = itemFactory.getFatBucketUnits(handItem);
+                    if (units >= GenItemFactory.FAT_BUCKET_CAPACITY) {
+                        player.sendMessage("§eThat fat bucket is already full.");
+                        return;
+                    }
+                    int toAdd = Math.min(GenItemFactory.FAT_BUCKET_FILL_UNITS,
+                            GenItemFactory.FAT_BUCKET_CAPACITY - units);
+                    hit.setType(Material.AIR, false);
+                    units += toAdd;
+                    itemFactory.setFatBucketUnits(handItem, units);
+                    player.getInventory().setItemInMainHand(handItem);
+                    player.sendMessage("§aFilled fat bucket: §f+" + toAdd
+                            + " §aunits (§f" + units + "§a/" + GenItemFactory.FAT_BUCKET_CAPACITY + ").");
+                    return;
+                }
             }
-
-            int toAdd = Math.min(GenItemFactory.FAT_BUCKET_FILL_UNITS, GenItemFactory.FAT_BUCKET_CAPACITY - units);
-            event.getClickedBlock().setType(Material.AIR, false);
-            units += toAdd;
-
-            itemFactory.setFatBucketUnits(handItem, units);
-            player.getInventory().setItemInMainHand(handItem);
-            player.sendMessage("§aFilled fat bucket: §f+" + toAdd + " §aunits (§f" + units + "§a/" + GenItemFactory.FAT_BUCKET_CAPACITY + ").");
-            return;
         }
 
-        // Otherwise try to place a source into the adjacent target block
+        // ── PLACE: place a unit into the adjacent block ───────────────────────
+        if (event.getClickedBlock() == null) return;
         Block target = event.getClickedBlock().getRelative(event.getBlockFace());
         if (!canReplace(target.getType())) {
             player.sendMessage("§cCannot place liquid there.");
@@ -261,8 +350,6 @@ public class GenListener implements Listener {
 
         target.setType(type.getFatBucketFluidType(), false);
         units--;
-
-        // Keep it as the same fat bucket item even at 0 units
         itemFactory.setFatBucketUnits(handItem, units);
         player.getInventory().setItemInMainHand(handItem);
         if (units <= 0) {
@@ -272,61 +359,92 @@ public class GenListener implements Listener {
         }
     }
 
+    // ── Lava Gen Bucket ───────────────────────────────────────────────────────
+    @EventHandler(priority = org.bukkit.event.EventPriority.LOWEST)
+    public void onBucketEmpty(PlayerBucketEmptyEvent event) {
+        // Read from the actual hand — event.getItemStack() returns the post-use
+        // result (empty bucket) in newer Paper versions, losing PDC data.
+        Player    player = event.getPlayer();
+        ItemStack item   = getHandItem(player, event.getHand());
+        GenItemType type = itemFactory.getTypeFromItem(item);
+
+        // Fat buckets: cancel vanilla empty so our onInteract handles placement
+        if (type != null && type.isFatBucket()) {
+            event.setCancelled(true);
+            return;
+        }
+
+        if (type == null || !type.isLavaGenBucket()) return;
+
+        event.setCancelled(true);
+        Block     target    = event.getBlockClicked().getRelative(event.getBlockFace());
+        BlockFace direction = itemFactory.getDirectionFromItem(item);
+        int placed = placeVerticalLavaColumn(target,
+                direction == BlockFace.DOWN ? BlockFace.DOWN : BlockFace.UP);
+        consumeSingleBucket(player, event.getHand());
+        player.sendMessage("§aLava Gen Bucket placed §f" + placed + " §alava source blocks.");
+    }
+
+    // ── Animation helpers ─────────────────────────────────────────────────────
+
+    /** Cancel a running animation silently (e.g. when a new gen is placed at same spot). */
+    private void cancelExistingAnimation(String key, boolean removeOrigin) {
+        GenAnimation anim = animations.remove(key);
+        if (anim == null) return;
+        if (anim.task != null) anim.task.cancel();
+        if (removeOrigin && (anim.origin.getType() == ANIM_ACTIVE || anim.origin.getType() == ANIM_REMOVING))
+            anim.origin.setType(Material.AIR, false);
+    }
+
+    // ── Lava column placer ────────────────────────────────────────────────────
+
     private int placeVerticalLavaColumn(Block start, BlockFace direction) {
         int minY = start.getWorld().getMinHeight();
         int maxY = start.getWorld().getMaxHeight() - 1;
-
-        int x = start.getX();
-        int z = start.getZ();
+        int x = start.getX(), z = start.getZ();
         int count = 0;
 
         if (direction == BlockFace.UP) {
             for (int y = start.getY(); y <= maxY; y++) {
-                Block block = start.getWorld().getBlockAt(x, y, z);
-                if (block.getType() == Material.BEDROCK) continue;
-                if (!canReplace(block.getType())) continue;
-                block.setType(Material.LAVA, false);
+                Block b = start.getWorld().getBlockAt(x, y, z);
+                if (b.getType() == Material.BEDROCK) continue;
+                if (!canReplace(b.getType())) continue;
+                b.setType(Material.LAVA, false);
                 count++;
             }
         } else {
             for (int y = start.getY(); y >= minY; y--) {
-                Block block = start.getWorld().getBlockAt(x, y, z);
-                if (block.getType() == Material.BEDROCK) continue;
-                if (!canReplace(block.getType())) continue;
-                block.setType(Material.LAVA, false);
+                Block b = start.getWorld().getBlockAt(x, y, z);
+                if (b.getType() == Material.BEDROCK) continue;
+                if (!canReplace(b.getType())) continue;
+                b.setType(Material.LAVA, false);
                 count++;
             }
         }
-
         return count;
     }
+
+    // ── Utility ───────────────────────────────────────────────────────────────
 
     private BlockFace resolveDirection(Player player) {
         float pitch = player.getLocation().getPitch();
         if (pitch <= -60f) return BlockFace.UP;
-        if (pitch >= 60f) return BlockFace.DOWN;
-
+        if (pitch >= 60f)  return BlockFace.DOWN;
         float yaw = (player.getLocation().getYaw() % 360 + 360) % 360;
-        if (yaw >= 45 && yaw < 135) return BlockFace.WEST;
+        if (yaw >= 45  && yaw < 135) return BlockFace.WEST;
         if (yaw >= 135 && yaw < 225) return BlockFace.NORTH;
         if (yaw >= 225 && yaw < 315) return BlockFace.EAST;
         return BlockFace.SOUTH;
     }
 
-    private boolean canReplace(Material material) {
-        return material.isAir() || material == Material.WATER || material == Material.LAVA;
-    }
-
-    private boolean canOverwriteGenerated(Material material) {
-        return material != Material.BEDROCK;
-    }
+    private boolean canOverwrite(Material m) { return m != Material.BEDROCK; }
+    private boolean canReplace(Material m)   { return m.isAir() || m == Material.WATER || m == Material.LAVA; }
 
     private void consumeSingleBucket(Player player, EquipmentSlot hand) {
         ItemStack held = getHandItem(player, hand);
         if (held == null) return;
-        int amount = held.getAmount();
-        if (amount > 1) {
-            held.setAmount(amount - 1);
+        if (held.getAmount() > 1) {
+            held.setAmount(held.getAmount() - 1);
             setHandItem(player, hand, held);
             player.getInventory().addItem(new ItemStack(Material.BUCKET));
         } else {
@@ -341,16 +459,13 @@ public class GenListener implements Listener {
     }
 
     private void setHandItem(Player player, EquipmentSlot hand, ItemStack item) {
-        if (hand == EquipmentSlot.OFF_HAND) {
-            player.getInventory().setItemInOffHand(item);
-        } else {
-            player.getInventory().setItemInMainHand(item);
-        }
+        if (hand == EquipmentSlot.OFF_HAND) player.getInventory().setItemInOffHand(item);
+        else                                player.getInventory().setItemInMainHand(item);
     }
 
     private String format(double value) {
         if (value >= 1_000_000) return String.format("%.1fM", value / 1_000_000.0);
-        if (value >= 1_000) return String.format("%.1fK", value / 1_000.0);
+        if (value >= 1_000)     return String.format("%.1fK", value / 1_000.0);
         return String.format("%.2f", value);
     }
 
